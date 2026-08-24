@@ -11,6 +11,7 @@ import {
   redactSecrets,
   requiresDelivery,
   runCheckCommand,
+  transcriptEvidenceEvent,
 } from "../src/index.js";
 
 describe("platform acceptance checks", () => {
@@ -62,6 +63,44 @@ describe("platform acceptance checks", () => {
   it("caps the failure output at 2000 chars", () => {
     const event = checkEvent("x", 1, "z".repeat(5000));
     expect((event.output as string).length).toBe(2000);
+  });
+});
+
+describe("transcript evidence (non-gating)", () => {
+  it("emits a failed transcript as an evidence event, not a platform check", () => {
+    const event = transcriptEvidenceEvent("failed");
+    expect(event).toEqual({
+      type: "evidence",
+      data: {
+        name: "transcript",
+        status: "failed",
+        reason: "transcript_upload_failed",
+      },
+    });
+    expect(event?.type).not.toBe("check");
+    expect(event?.data).not.toHaveProperty("self_reported");
+  });
+
+  it("never appears in the receipt check list (receipts only collect type=check)", () => {
+    const evidence = transcriptEvidenceEvent("failed");
+    const allEmitted = [
+      {
+        type: "check",
+        data: { self_reported: false, command: "pnpm test", status: "passed", exit_code: 0 },
+      },
+      evidence,
+    ];
+    const receiptChecks = allEmitted.filter((e) => e?.type === "check");
+    expect(receiptChecks).toHaveLength(1);
+    expect((receiptChecks[0]?.data as Record<string, unknown>)?.command).toBe("pnpm test");
+  });
+
+  it("returns null for a successful upload", () => {
+    expect(transcriptEvidenceEvent("uploaded")).toBeNull();
+  });
+
+  it("returns null when the transcript was empty", () => {
+    expect(transcriptEvidenceEvent("empty")).toBeNull();
   });
 });
 

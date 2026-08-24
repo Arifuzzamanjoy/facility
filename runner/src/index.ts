@@ -256,7 +256,7 @@ async function main() {
           },
         ]).catch(() => undefined);
       }
-      await uploadTranscript();
+      const transcriptUploaded = await uploadTranscript();
       await stopCheckpoint();
       checkpointStop = undefined;
       return {
@@ -264,6 +264,7 @@ async function main() {
         securityReport,
         securityReportConfigured,
         securityEvidenceConfigured,
+        transcriptUploaded,
       };
     });
     const {
@@ -271,6 +272,7 @@ async function main() {
       securityReport,
       securityReportConfigured,
       securityEvidenceConfigured,
+      transcriptUploaded,
     } = captured;
     if (interruptRequested) {
       await phases.skip("acceptance", "agent_canceled");
@@ -350,6 +352,7 @@ async function main() {
         },
       ]);
     }
+    await emitTranscriptEvidence(transcriptUploaded, emit);
     const checksPassed =
       engineCode === 0 && checksConfigured && progressConfigured
         ? githubCi || readOnlyMode
@@ -856,25 +859,41 @@ function isSecurityReport(value: unknown): value is Record<string, unknown> {
   });
 }
 
-async function uploadTranscript() {
-  const size = await stat(transcriptFile)
+export type TranscriptUploadState = "uploaded" | "empty" | "failed";
+
+export async function uploadTranscript(
+  deps: {
+    transcriptPath?: string;
+    upload?: (path: string) => Promise<void>;
+    emitEvents?: (events: RunEvent[]) => Promise<void>;
+  } = {},
+): Promise<TranscriptUploadState> {
+  const path = deps.transcriptPath ?? transcriptFile;
+  const upload =
+    deps.upload ??
+    ((filePath: string) =>
+      api(
+        `/internal/runs/${currentRunId()}/transcript`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/x-ndjson" },
+          duplex: "half",
+        } as RequestInit & { duplex: "half" },
+        () => createReadStream(filePath) as unknown as RequestInit["body"],
+      ).then(() => undefined));
+  const emitEvents = deps.emitEvents ?? emit;
+  const size = await stat(path)
     .then((info) => info.size)
     .catch(() => 0);
-  if (size === 0) return;
+  if (size === 0) return "empty";
   try {
-    await api(
-      `/internal/runs/${currentRunId()}/transcript`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/x-ndjson" },
-        duplex: "half",
-      } as RequestInit & { duplex: "half" },
-      () => createReadStream(transcriptFile) as unknown as RequestInit["body"],
-    );
+    await upload(path);
+    return "uploaded";
   } catch {
-    await emit([{ type: "artifact_error", data: { kind: "transcript_upload_failed" } }]).catch(
-      () => undefined,
-    );
+    await emitEvents([
+      { type: "artifact_error", data: { kind: "transcript_upload_failed" } },
+    ]).catch(() => undefined);
+    return "failed";
   }
 }
 
@@ -1762,6 +1781,31 @@ export function deliveryStatusEvent(
       ...(error ? { error } : {}),
     },
   };
+}
+
+export function transcriptEvidenceEvent(state: TranscriptUploadState): RunEvent | null {
+  if (state !== "failed") return null;
+  return {
+    type: "evidence",
+    data: {
+      name: "transcript",
+      status: "failed",
+      reason: "transcript_upload_failed",
+    },
+  };
+}
+
+// Best-effort: surrounding platform checks gate the result, so a failed
+// emit there must fail the run. This is non-gating evidence, so a failed
+// emit must not—otherwise a degraded events endpoint turns a successful
+// run into a failed one, reintroducing the gating this event exists to avoid.
+export async function emitTranscriptEvidence(
+  state: TranscriptUploadState,
+  emitEvents: (events: RunEvent[]) => Promise<void>,
+): Promise<void> {
+  const event = transcriptEvidenceEvent(state);
+  if (!event) return;
+  await emitEvents([event]).catch(() => undefined);
 }
 
 function isSecurityMode(mode: string) {
