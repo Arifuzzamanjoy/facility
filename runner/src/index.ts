@@ -257,7 +257,8 @@ async function main() {
           },
         ]).catch(() => undefined);
       }
-      await uploadTranscript();
+      const transcriptState = await uploadTranscript();
+      await emitTranscriptEvidence(transcriptState, emit);
       await stopCheckpoint();
       checkpointStop = undefined;
       return {
@@ -873,11 +874,19 @@ function isSecurityReport(value: unknown): value is Record<string, unknown> {
   });
 }
 
-async function uploadTranscript() {
-  const size = await stat(transcriptFile)
+export type TranscriptUploadState = "uploaded" | "empty" | "failed";
+
+// `transcriptPath` stays injectable because the default is an absolute path
+// inside the sandbox runtime root, which tests cannot write to.
+export async function uploadTranscript({
+  transcriptPath = transcriptFile,
+}: {
+  transcriptPath?: string;
+} = {}): Promise<TranscriptUploadState> {
+  const size = await stat(transcriptPath)
     .then((info) => info.size)
     .catch(() => 0);
-  if (size === 0) return;
+  if (size === 0) return "empty";
   try {
     await api(
       `/internal/runs/${currentRunId()}/transcript`,
@@ -886,12 +895,14 @@ async function uploadTranscript() {
         headers: { "content-type": "application/x-ndjson" },
         duplex: "half",
       } as RequestInit & { duplex: "half" },
-      () => createReadStream(transcriptFile) as unknown as RequestInit["body"],
+      () => createReadStream(transcriptPath) as unknown as RequestInit["body"],
     );
+    return "uploaded";
   } catch {
     await emit([{ type: "artifact_error", data: { kind: "transcript_upload_failed" } }]).catch(
       () => undefined,
     );
+    return "failed";
   }
 }
 
@@ -1779,6 +1790,31 @@ export function deliveryStatusEvent(
       ...(error ? { error } : {}),
     },
   };
+}
+
+export function transcriptEvidenceEvent(state: TranscriptUploadState): RunEvent | null {
+  if (state !== "failed") return null;
+  return {
+    type: "evidence",
+    data: {
+      name: "transcript",
+      status: "failed",
+      reason: "transcript_upload_failed",
+    },
+  };
+}
+
+// Best-effort: surrounding platform checks gate the result, so a failed
+// emit there must fail the run. This is non-gating evidence, so a failed
+// emit must not—otherwise a degraded events endpoint turns a successful
+// run into a failed one, reintroducing the gating this event exists to avoid.
+export async function emitTranscriptEvidence(
+  state: TranscriptUploadState,
+  emitEvents: (events: RunEvent[]) => Promise<void>,
+): Promise<void> {
+  const event = transcriptEvidenceEvent(state);
+  if (!event) return;
+  await emitEvents([event]).catch(() => undefined);
 }
 
 function isSecurityMode(mode: string) {
